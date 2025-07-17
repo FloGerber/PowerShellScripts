@@ -1,0 +1,2164 @@
+##
+## TODO: Manuel Overwrite for Automatic Questions
+##
+## TODO: Remove Irrelavant from score, for example app service is not uses then remove counter
+##
+## TODO: Validate against Proper tenant with resources
+##
+
+###################################
+###                             ###
+###       Security Pillar       ###
+###                             ###
+###################################
+
+# # Check if any 'Owner' role assignments exist
+# function Check-OwnerRoleAssignment {
+#     try {
+#         $owners = Get-AzRoleAssignment | Where-Object { $_.RoleDefinitionName -eq 'Owner' }
+#         return [PSCustomObject]@{
+#             Result  = ($owners.Count -gt 0)
+#             Details = $owners
+#         }
+#     } catch {
+#         return [PSCustomObject]@{
+#             Result  = $false
+#             Details = "Error: $($_.Exception.Message)"
+#         }
+#     }
+# }
+
+# Check if Privileged Roles are assignen and the users with these are protected
+function Check-PrivilegedUserProtection {
+    try {
+        # Get high-impact role assignments from Azure RBAC
+        $privilegedRoles = @('Owner', 'Contributor', 'User Access Administrator')
+        $assignments = Get-AzRoleAssignment | Where-Object {
+            $_.RoleDefinitionName -in $privilegedRoles
+        }
+
+        $aadUsers = @()
+        foreach ($assignment in $assignments) {
+            if ($assignment.SignInName) {
+                $user = Get-MgUser -UserId $assignment.SignInName
+                if ($user) {
+                    $aadUsers += $user
+                }
+            }
+        }
+
+        # Check MFA status for each user
+        $mfaFailures = @()
+        foreach ($user in $aadUsers) {
+            $methods = Get-MgUserAuthenticationMethod -UserId $user.Id
+            $hasMFA = $methods | Where-Object { $_.ODataType -match 'fido2' -or $_.ODataType -match 'phone' }
+            if (-not $hasMFA) {
+                $mfaFailures += $user.Name
+            }
+        }
+
+        # Check Conditional Access enforcement
+        $caPolicies = Get-MgIdentityConditionalAccessPolicy
+        $mfaRequiredPolicies = $caPolicies | Where-Object {
+            $_.Conditions.Applications.IncludeApplications.Count -gt 0 -and
+            $_.GrantControls.BuiltInControls -contains 'mfa'
+        }
+
+        return [PSCustomObject]@{
+            Result  = ($mfaFailures.Count -eq 0 -and $mfaRequiredPolicies.Count -gt 0)
+            Details = @{
+                UnprotectedUsers = $mfaFailures
+                ConditionalAccessEnforced = $mfaRequiredPolicies
+            }
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Details = "Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check if all storage accounts enforce HTTPS traffic only and encryption is enabled for storage accounts and Disks
+function Check-StorageEncryption {
+    try {
+        $unencryptedResources = @()
+
+        # Check Storage Accounts
+        $storageAccounts = Get-AzStorageAccount
+        foreach ($sa in $storageAccounts) {
+            if (-not $sa.EnableHttpsTrafficOnly -or -not $sa.Encryption.Services.Blob.Enabled) {
+                $unencryptedResources += $sa
+            }
+        }
+
+        # Check Managed Disks
+        $disks = Get-AzDisk | Where-Object { $_.Encryption.Type -eq 'None' }
+        if ($disks) { $unencryptedResources += $disks }
+
+        return [PSCustomObject]@{
+            Result  = ($unencryptedResources.Count -eq 0)
+            Details = $unencryptedResources
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Details = "Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check whether any NSGs and Firewall are deployed
+function Check-NSGFirewallConfig {
+    try {
+        $unprotectedSubnets = @()
+
+        $nsgs = Get-AzNetworkSecurityGroup
+        $firewalls = Get-AzFirewall
+        $vnets = Get-AzVirtualNetwork
+
+        foreach ($vnet in $vnets) {
+            foreach ($subnet in $vnet.Subnets) {
+                $hasNSG = ($subnet.NetworkSecurityGroup -ne $null)
+                if (-not $hasNSG) {
+                    $unprotectedSubnets += $subnet
+                }
+            }
+        }
+
+        $firewallPresent = ($firewalls.Count -gt 0)
+
+        return [PSCustomObject]@{
+            Result  = ($unprotectedSubnets.Count -eq 0 -and $firewallPresent)
+            Details = @{
+                MissingNSGs = $unprotectedSubnets
+                AzureFirewallConfigured = $firewalls
+            }
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Details = "Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check for Public exposed HTTP workloads
+function Check-HttpExposureWithoutWAF {
+    try {
+        $httpRisks = @()
+
+        # App Services without HTTPS-only enforcement
+        $apps = Get-AzWebApp
+        foreach ($app in $apps) {
+            if (-not $app.SiteConfig.HttpsOnly) {
+                $httpRisks += @{
+                    Type     = "AppService"
+                    Name     = $app.Name
+                    Location = $app.Location
+                    Note     = "HTTPS not enforced"
+                }
+            }
+        }
+
+        # NSG Rules exposing port 80
+        $nsgs = Get-AzNetworkSecurityGroup
+        foreach ($nsg in $nsgs) {
+            foreach ($rule in $nsg.SecurityRules) {
+                if ($rule.Access -eq "Allow" -and $rule.Direction -eq "Inbound" -and
+                    $rule.DestinationPortRange -eq "80" -and $rule.SourceAddressPrefix -eq "0.0.0.0/0") {
+
+                    $httpRisks += @{
+                        Type     = "NSG"
+                        Name     = $nsg.Name
+                        Location = $nsg.Location
+                        Note     = "Port 80 open to public"
+                    }
+                }
+            }
+        }
+
+        # App Gateways routing HTTP without WAF
+        $gateways = Get-AzApplicationGateway
+        foreach ($gw in $gateways) {
+            if (-not $gw.WebApplicationFirewallConfiguration.Enabled) {
+                $httpRisks += @{
+                    Type     = "AppGateway"
+                    Name     = $gw.Name
+                    Location = $gw.Location
+                    Note     = "No WAF protection"
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result  = ($httpRisks.Count -eq 0)
+            Details = $httpRisks
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Details = "Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check if Microsoft Defender for Cloud is enabled
+function Check-DefenderEnabled {
+    try {
+        $defenderPlans = Get-AzSecurityPricing | Where-Object {
+            $_.PricingTier -eq 'Standard'
+        }
+
+        return [PSCustomObject]@{
+            Result  = ($defenderPlans.Count -gt 0)
+            Details = $defenderPlans
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Details = "Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check if any Azure Key Vaults are deployed
+function Check-KeyVaultActiveUsage {
+    try {
+        $vaults = Get-AzKeyVault
+        $activeVaults = @()
+
+        foreach ($vault in $vaults) {
+            $secrets = Get-AzKeyVaultSecret -VaultName $vault.VaultName
+            $certs   = Get-AzKeyVaultCertificate -VaultName $vault.VaultName
+            $keys    = Get-AzKeyVaultKey -VaultName $vault.VaultName
+
+            if (($secrets.Count + $certs.Count + $keys.Count) -gt 0) {
+                $activeVaults += $vault
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result  = ($activeVaults.Count -gt 0)
+            Details = @{
+                UsedVaults  = $activeVaults
+                AllVaults   = $vaults
+            }
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Details = "Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check if high privilede roles are assigned on root, subscription and Management Group level
+function Check-LeastPrivilegeAssignment {
+    try {
+        $roles = Get-AzRoleAssignment
+        $broadScopes = $roles | Where-Object {
+            $_.RoleDefinitionName -in @('Owner', 'Contributor') -and (
+                $_.Scope -eq '/' -or
+                $_.Scope -like '/subscriptions/*' -or
+                $_.Scope -like '/providers/Microsoft.Management/managementGroups/*'
+            )
+        }
+
+        return [PSCustomObject]@{
+            Result  = ($broadScopes.Count -eq 0)
+            Details = $broadScopes
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Details = "Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check if diagnostic settings are configured
+function Check-DiagnosticLogging {
+    try {
+        # 1. Get all Azure resources
+        $resources = Get-AzResource
+
+        # 2. Initialize a list for logging gaps
+        $missingDiagnostics = @()
+
+        # 3. Scan each resource for diagnostic settings
+        foreach ($resource in $resources) {
+            $diagSetting = Get-AzDiagnosticSetting -ResourceId $resource.Id -ErrorAction SilentlyContinue
+
+            # 3a. Case: No diagnostic setting exists
+            if (-not $diagSetting) {
+                $missingDiagnostics += [PSCustomObject]@{
+                    ResourceName = $resource.Name
+                    ResourceType = $resource.Type
+                    ResourceId   = $resource.Id
+                    Status       = "❌ Missing"
+                    Reason       = "No diagnostic setting found"
+                }
+                continue
+            }
+
+            # 3b. Case: Setting exists but no destination configured
+            if (-not $diagSetting.WorkspaceId -and -not $diagSetting.StorageAccountId -and -not $diagSetting.EventHubAuthorizationRuleId) {
+                $missingDiagnostics += [PSCustomObject]@{
+                    ResourceName = $resource.Name
+                    ResourceType = $resource.Type
+                    ResourceId   = $resource.Id
+                    Status       = "⚠️ Incomplete"
+                    Reason       = "Diagnostics configured, but no destination set"
+                }
+            }
+        }
+
+        # 4. Return structured result
+        return [PSCustomObject]@{
+            Result  = ($missingDiagnostics.Count -eq 0)
+            Summary = @{
+                TotalResourcesScanned       = $resources.Count
+                ResourcesWithIncompleteLogs = $missingDiagnostics.Count
+                CompliantResources          = $resources.Count - $missingDiagnostics.Count
+            }
+            Details = $missingDiagnostics
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Details = "⚠️ Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check for Azure Policy assignments
+function Check-AzurePolicyAssignment {
+    try {
+        # Grab all assignments
+        $assignments = Get-AzPolicyAssignment
+
+        # Filter by well-known initiatives or tags
+        $securityPolicies = $assignments | Where-Object {
+            $_.Properties.DisplayName -match 'Security' -or
+            $_.Properties.DisplayName -match 'Benchmark' -or
+            $_.Properties.Description -match 'CIS|NIST|ISO|SOC'
+        }
+
+        return [PSCustomObject]@{
+            Result  = ($securityPolicies.Count -gt 0)
+            Details = $securityPolicies
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Details = "Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check if DDoS Protection Plans are configured
+function Check-DDoSProtectionPlan {
+    try {
+        $plans = Get-AzDdosProtectionPlan
+        $vnets = Get-AzVirtualNetwork | Where-Object {
+            $_.DdosProtectionPlan -ne $null
+        }
+
+        return [PSCustomObject]@{
+            Result  = ($vnets.Count -gt 0)
+            Details = @{
+                ProtectionPlans = $plans
+                ProtectedVNets  = $vnets
+            }
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Details = "Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+###################################
+###                             ###
+###      Reliability Pillar     ###
+###                             ###
+###################################
+
+# Check if Site Recovery Vaults exist for RPO (Recovery Point Objective)/RTO (Recovery Time Objective) definition
+function Check-SiteRecoveryReplication {
+    try {
+        $vaults = Get-AzRecoveryServicesVault
+        $replicatedItems = @()
+
+        foreach ($vault in $vaults) {
+            $items = Get-AzRecoveryServicesReplicationProtectedItem -VaultId $vault.Id
+            if ($items.Count -gt 0) {
+                $replicatedItems += $items
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result  = ($replicatedItems.Count -gt 0)
+            Details = $replicatedItems
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Details = "Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check if any VMs use Availability Zones
+function Check-FallbackCapability {
+    try {
+        $resilientResources = @()
+
+        # --- Virtual Machines ---
+        $vms = Get-AzVM
+        $totalVMs = $vms.Count
+        foreach ($vm in $vms) {
+            $hasHA = ($vm.Zones.Count -gt 0 -or
+                      $vm.AvailabilitySet -ne $null -or
+                      $vm.VirtualMachineScaleSetId -ne $null)
+
+            if ($hasHA) {
+                $resilientResources += [PSCustomObject]@{
+                    ResourceType = "VirtualMachine"
+                    ResourceName = $vm.Name
+                    Fallback     = "Zone or Scale/Set deployment"
+                }
+            }
+        }
+
+        # --- Application Gateways ---
+        $appGWs = Get-AzApplicationGateway
+        $totalAppGWs = $appGWs.Count
+        foreach ($gw in $appGWs) {
+            if ($gw.Zones.Count -gt 0) {
+                $resilientResources += [PSCustomObject]@{
+                    ResourceType = "AppGateway"
+                    ResourceName = $gw.Name
+                    Fallback     = "Multi-zone deployment"
+                }
+            }
+        }
+
+        # --- AKS Clusters ---
+        $aksClusters = Get-AzAksCluster
+        $totalAks = $aksClusters.Count
+        foreach ($aks in $aksClusters) {
+            $multiZonePool = $aks.AgentPoolProfiles | Where-Object {
+                $_.AvailabilityZones.Count -gt 1
+            }
+            if ($multiZonePool.Count -gt 0) {
+                $resilientResources += [PSCustomObject]@{
+                    ResourceType = "AKS"
+                    ResourceName = $aks.Name
+                    Fallback     = "Multi-zone node pool"
+                }
+            }
+        }
+
+        # --- SQL Servers ---
+        $sqlServers = Get-AzSqlServer
+        $totalSql = $sqlServers.Count
+        foreach ($sql in $sqlServers) {
+            $fallbackEnabled = $sql.Identity.Type -ne $null # Placeholder logic
+            if ($fallbackEnabled) {
+                $resilientResources += [PSCustomObject]@{
+                    ResourceType = "SQLServer"
+                    ResourceName = $sql.ServerName
+                    Fallback     = "Geo-redundant or zone-aware"
+                }
+            }
+        }
+
+        # --- Storage Accounts ---
+        $storageAccounts = Get-AzStorageAccount
+        $totalStorage = $storageAccounts.Count
+        $resilientStorage = $storageAccounts | Where-Object {
+            $_.Sku.Name -match 'GRS|ZRS|GZRS'
+        }
+        foreach ($sa in $resilientStorage) {
+            $resilientResources += [PSCustomObject]@{
+                ResourceType = "StorageAccount"
+                ResourceName = $sa.StorageAccountName
+                Fallback     = "Redundant storage SKU ($($sa.Sku.Name))"
+            }
+        }
+
+        # --- Summary Output ---
+        $totalResources = $totalVMs + $totalAppGWs + $totalAks + $totalSql + $totalStorage
+
+        return [PSCustomObject]@{
+            Result  = ($resilientResources.Count -gt 0)
+            Summary = @{
+                TotalResourcesScanned = $totalResources
+                ResourcesWithFallback = $resilientResources.Count
+                Breakdown = @{
+                    VMs            = $totalVMs
+                    AppGateways     = $totalAppGWs
+                    AKSClusters     = $totalAks
+                    SQLServers      = $totalSql
+                    StorageAccounts = $totalStorage
+                }
+            }
+            Details = $resilientResources
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Details = "🚨 Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check for existing metric alert rules (Azure Monitor)
+function Check-MetricAlerts {
+    try {
+        $alerts = Get-AzMetricAlertRuleV2
+        $appInsights = Get-AzApplicationInsights
+
+        $monitoring = $alerts + $appInsights
+
+        return [PSCustomObject]@{
+            Result  = ($monitoring.Count -gt 0)
+            Details = $monitoring
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Details = "Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check if backup policies are assigned in Recovery Vaults
+function Check-BackupPolicy {
+    try {
+        $vaults = Get-AzRecoveryServicesVault
+        $policies = @()
+
+        foreach ($vault in $vaults) {
+            $policy = Get-AzRecoveryServicesBackupProtectionPolicy -VaultId $vault.Id
+            $protectedItems = Get-AzRecoveryServicesBackupItem -VaultId $vault.Id
+
+            if ($policy.Count -gt 0 -and $protectedItems.Count -gt 0) {
+                $policies += $policy
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result  = ($policies.Count -gt 0)
+            Details = $policies
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Details = "Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check for successful failover test drills
+function Check-SiteRecoveryDrill {
+    try {
+        $vaults = Get-AzRecoveryServicesVault
+        $recentTestJobs = @()
+
+        foreach ($vault in $vaults) {
+            Set-AzRecoveryServicesVaultContext -Vault $vault
+
+            $jobs = Get-AzRecoveryServicesJob | Where-Object {
+                $_.ActivityName -like '*TestFailover*' -and
+                $_.Status -eq 'Completed' -and
+                $_.StartTime -gt (Get-Date).AddMonths(-6)
+            }
+
+            if ($jobs.Count -gt 0) {
+                $recentTestJobs += $jobs | ForEach-Object {
+                    [PSCustomObject]@{
+                        VaultName   = $vault.Name
+                        JobName     = $_.Name
+                        Activity    = $_.ActivityName
+                        CompletedOn = $_.EndTime
+                    }
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result  = ($recentTestJobs.Count -gt 0)
+            Details = $recentTestJobs
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Details = "❌ Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check if App Services use auto-heal for self-recovery
+function Check-WorkloadAutoRecovery {
+    try {
+        $resilientWorkloads = @()
+        $unprotectedWorkloads = @()
+
+        # --- App Services ---
+        $apps = Get-AzWebApp
+        foreach ($app in $apps) {
+            $config = $app.SiteConfig
+            if ($config.AutoHealEnabled -and $config.AutoHealRules -ne $null -and $config.AutoHealRules.Triggers.Count -gt 0) {
+                $resilientWorkloads += [PSCustomObject]@{
+                    ResourceType   = "AppService"
+                    ResourceName   = $app.Name
+                    FallbackAction = "Auto-Heal (Triggers: Restart, Slow Response, etc.)"
+                }
+            } else {
+                $unprotectedWorkloads += [PSCustomObject]@{
+                    ResourceType   = "AppService"
+                    ResourceName   = $app.Name
+                    FallbackStatus = if ($config.AutoHealEnabled) { "Enabled but no triggers" } else { "Disabled" }
+                }
+            }
+        }
+
+        # --- Virtual Machines ---
+        $vms = Get-AzVM
+        foreach ($vm in $vms) {
+            $hasRecovery = ($vm.AvailabilitySet -ne $null -or $vm.VirtualMachineScaleSetId -ne $null)
+
+            if ($hasRecovery) {
+                $resilientWorkloads += [PSCustomObject]@{
+                    ResourceType   = "VirtualMachine"
+                    ResourceName   = $vm.Name
+                    FallbackAction = "Automatic Repair via Availability Set / Scale Set"
+                }
+            } else {
+                $unprotectedWorkloads += [PSCustomObject]@{
+                    ResourceType   = "VirtualMachine"
+                    ResourceName   = $vm.Name
+                    FallbackStatus = "Standalone VM (no auto-recovery)"
+                }
+            }
+        }
+
+        # --- Final Output ---
+        return [PSCustomObject]@{
+            Result = ($resilientWorkloads.Count -gt 0)
+            Summary = @{
+                TotalAppServices        = $apps.Count
+                TotalVMs                = $vms.Count
+                WorkloadsWithFallback   = $resilientWorkloads.Count
+                WorkloadsWithoutRecovery = $unprotectedWorkloads.Count
+            }
+            Details = @{
+                ProtectedWorkloads   = $resilientWorkloads
+                UnprotectedWorkloads = $unprotectedWorkloads
+            }
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Details = "🚨 Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check if Traffic Manager profiles exist for geo-distribution
+function Check-TrafficRoutingStrategy {
+    try {
+        $frontDoors     = Get-AzFrontDoor
+        $trafficProfiles = Get-AzTrafficManagerProfile
+
+        $routingInsights = @()
+
+        foreach ($fd in $frontDoors) {
+            $routingInsights += [PSCustomObject]@{
+                Type           = "FrontDoor"
+                Name           = $fd.Name
+                ResourceGroup  = $fd.ResourceGroupName
+                RoutingMethod  = "Performance or Latency-based"
+                EndpointCount  = $fd.FrontendEndpoints.Count
+            }
+        }
+
+        foreach ($tm in $trafficProfiles) {
+            $routingInsights += [PSCustomObject]@{
+                Type           = "TrafficManager"
+                Name           = $tm.Name
+                ResourceGroup  = $tm.ResourceGroupName
+                RoutingMethod  = $tm.TrafficRoutingMethod
+                EndpointCount  = $tm.Endpoints.Count
+            }
+        }
+
+        $totalRouting = $frontDoors.Count + $trafficProfiles.Count
+
+        return [PSCustomObject]@{
+            Result  = ($routingInsights.Count -gt 0)
+            Summary = @{
+                TotalProfilesChecked    = $totalRouting
+                ProfilesWithRouting     = $routingInsights.Count
+                FrontDoorProfiles       = $frontDoors.Count
+                TrafficManagerProfiles  = $trafficProfiles.Count
+            }
+            Details = $routingInsights
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Details = "🚨 Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check if usage quotas are actively monitored
+function Check-QuotaAlertingConfigured {
+    try {
+        $quotaAlertRules = Get-AzMetricAlertRuleV2 | Where-Object {
+            $_.Criteria.AllOf.Any({
+                $_.MetricName -match 'Used.*Quota|Current.*Usage|Percentage.*Used|Limit.*Remaining'
+            }) -and $_.Enabled
+        }
+
+        $alertsByResource = @()
+        foreach ($alert in $quotaAlertRules) {
+            $alertsByResource += [PSCustomObject]@{
+                AlertName      = $alert.Name
+                ResourceGroup  = $alert.ResourceGroupName
+                TargetResource = $alert.Scopes[0]
+                MetricTracked  = ($alert.Criteria.AllOf | Select-Object -First 1).MetricName
+                Threshold      = ($alert.Criteria.AllOf | Select-Object -First 1).Threshold
+                Evaluation     = $alert.EvaluationFrequency
+                ActionGroup    = ($alert.Actions | Select-Object -First 1).ActionGroupId
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result  = ($alertsByResource.Count -gt 0)
+            Summary = @{
+                QuotaMetricsMonitored = $alertsByResource.Count
+                TotalAlertRulesScanned = (Get-AzMetricAlertRuleV2).Count
+            }
+            Details = $alertsByResource
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Details = "🚨 Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+
+###################################
+###                             ###
+###         Cost Pillar         ###
+###                             ###
+###################################
+
+# Check if cost forecasting or budget tools are configured
+function Check-CostManagerUsage {
+    try {
+        # Try Azure Resource Graph first
+        $budgets = Search-AzGraph -Query "Resources | where type =~ 'microsoft.costmanagement/budgets'"
+        $budgetCount = if ($budgets) { $budgets.Count } else { 0 }
+
+        if ($budgetCount -gt 0) {
+            return [PSCustomObject]@{
+                Result      = $true
+                MethodUsed  = "ResourceGraph"
+                Summary     = "✅ Budgets found using Resource Graph."
+                BudgetCount = $budgetCount
+                Details     = $budgets | Select-Object name, location, properties.amount, properties.timePeriod
+            }
+        } else {
+            # Fallback: Use REST API directly
+            $context = Get-AzContext
+            $subId = $context.Subscription.Id
+            $accessToken = Get-AzAccessToken -ResourceUrl "https://management.azure.com/"
+            $plainToken = ConvertFrom-SecureString -SecureString $accessToken.Token -AsPlainText
+
+            $uri = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.CostManagement/budgets?api-version=2023-03-01"
+
+            $headers = @{ Authorization = "Bearer $plainToken" }
+            $restResponse = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
+
+            $restBudgets = $restResponse.value
+            $restCount = if ($restBudgets) { $restBudgets.Count } else { 0 }
+
+            return [PSCustomObject]@{
+                Result      = ($restCount -gt 0)
+                MethodUsed  = "REST API"
+                Summary     = if ($restCount -gt 0) {
+                    "✅ Budgets found using REST fallback."
+                } else {
+                    "❌ No budgets found via Graph or REST."
+                }
+                BudgetCount = $restCount
+                Details     = $restBudgets | Select-Object name, location, @{Name="amount"; Expression={ $_.properties.amount } }, @{Name="period"; Expression={ $_.properties.timePeriod } }
+            }
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Summary = "🚨 Budget check failed."
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check for idle or underutilized resources flagged by Advisor
+function Check-UnderutilizedResources {
+    try {
+        $recs = Get-AzAdvisorRecommendation | Where-Object {
+            $_.Category -eq "Cost" -and $_.Impact -eq "High"
+        }
+
+        $details = $recs | Select-Object `
+            RecommendationType, `
+            ResourceId, `
+            ShortDescription, `
+            ExtendedProperties
+
+        return [PSCustomObject]@{
+            Result  = ($recs.Count -eq 0)
+            Summary = if ($recs.Count -eq 0) {
+                "✅ No high-impact cost recommendations currently active."
+            } else {
+                "⚠️ $($recs.Count) high-impact cost-saving recommendations detected."
+            }
+            Details = $details
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Details = "🚨 Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+
+# FIXME: Needs review, Permision issue pretty sure!
+# Check for active Azure Reservations for predictable workloads
+function Check-ReservedInstances {
+    try {
+        $reservations = Get-AzReservation
+        $active = $reservations | Where-Object { $_.Status -eq 'Succeeded' }
+
+        return [PSCustomObject]@{
+            Result  = ($active.Count -gt 0)
+            Details = $active
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Details = "Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check if autoscale settings are configured for resource optimization
+function Check-AutoscaleSettings {
+    try {
+        $profiles = Get-AzAutoscaleSetting
+        $validProfiles = $profiles | Where-Object {
+            $_.Profiles.Count -gt 0 -and $_.TargetResourceUri
+        }
+
+        $details = @()
+
+        foreach ($p in $validProfiles) {
+            foreach ($profile in $p.Profiles) {
+                foreach ($rule in $profile.Rules) {
+                    $details += [PSCustomObject]@{
+                        AutoscaleName   = $p.Name
+                        TargetResource  = $p.TargetResourceUri
+                        Direction       = $rule.ScaleAction.Direction
+                        CoolDown        = $rule.ScaleAction.Cooldown
+                        MetricTrigger   = $rule.MetricTrigger.MetricName
+                        Operator        = $rule.MetricTrigger.Operator
+                        Threshold       = $rule.MetricTrigger.Threshold
+                        Enabled         = $p.Enabled
+                    }
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result  = ($details.Count -gt 0)
+            Summary = @{
+                TotalSettingsScanned    = $profiles.Count
+                ValidAutoscaleSettings  = $validProfiles.Count
+                ScalingRulesFound       = $details.Count
+            }
+            Details = $details
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Details = "🚨 Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check if Azure Tags are used for cost attribution
+function Check-AzureTagUsage {
+    try {
+        $allResources = Get-AzResource
+        $taggedResources = @()
+
+        foreach ($res in $allResources) {
+            if ($res.Tags.Count -gt 0) {
+                $tagInfo = @{
+                    ResourceName = $res.Name
+                    ResourceType = $res.Type
+                    ResourceGroup = $res.ResourceGroupName
+                    CostCenterTag = $res.Tags.ContainsKey("costcenter")
+                    OwnerTag      = $res.Tags.ContainsKey("owner")
+                    EnvironmentTag= $res.Tags.ContainsKey("environment")
+                }
+                $taggedResources += [PSCustomObject]$tagInfo
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result = ($taggedResources.Count -gt 0)
+            Summary = @{
+                TotalResourcesScanned = $allResources.Count
+                ResourcesWithTags     = $taggedResources.Count
+            }
+            Details = $taggedResources
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Summary = "🚨 Failed to check resource tags"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check for usage of Azure Functions (serverless footprint)
+function Check-ServerlessFunctionAppUsage {
+    try {
+        $functionApps = Get-AzFunctionApp
+        $consumptionApps = @()
+
+        foreach ($app in $functionApps) {
+            $appConfig = Get-AzFunctionApp -ResourceGroupName $app.ResourceGroupName -Name $app.Name
+            if ($appConfig.Sku -eq "Dynamic") {
+                $consumptionApps += $appConfig
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result  = ($consumptionApps.Count -gt 0)
+            Summary = @{
+                TotalFunctionApps      = $functionApps.Count
+                ConsumptionBasedApps   = $consumptionApps.Count
+            }
+            Details = $consumptionApps | Select-Object Name, Location, Sku, ResourceGroupName
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Summary = "🚨 Could not retrieve Function App data."
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check if Spot VMs are deployed for interruptible workloads
+function Check-SpotVMsUsage {
+    try {
+        $spotVMs = Get-AzVM | Where-Object {
+            $_.Priority -eq "Spot" -and $_.ProvisioningState -eq "Succeeded"
+        }
+
+        $devIndicators = @("dev", "test", "qa", "lab", "sandbox", "staging")
+
+        $nonCriticalVMs = @()
+        foreach ($vm in $spotVMs) {
+            $tags = $vm.Tags
+            $name = $vm.Name.ToLower()
+
+            $isTaggedNonCritical = $tags.Values -contains "Dev" -or
+                                   $tags.Values -contains "Test" -or
+                                   $tags.Values -contains "Low"
+
+            $isNamedNonCritical = $devIndicators | Where-Object { $name -like "*$_*" }
+
+            if ($isTaggedNonCritical -or $isNamedNonCritical.Count -gt 0) {
+                $nonCriticalVMs += $vm
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result = ($nonCriticalVMs.Count -gt 0)
+            Summary = @{
+                SpotVMsTotal         = $spotVMs.Count
+                SpotNonCriticalVMs   = $nonCriticalVMs.Count
+            }
+            Details = $nonCriticalVMs | Select-Object Name, ResourceGroupName, Location, Tags
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Summary = "🚨 Could not complete Spot VM check."
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check if Hybrid Benefit is applied for eligible workloads
+function Check-HybridBenefitLicensing {
+    try {
+        $vms = Get-AzVM
+        $licensedVMs   = @()
+        $unlicensedVMs = @()
+
+        foreach ($vm in $vms) {
+            $license = $vm.LicenseType
+            $osDisk  = $vm.StorageProfile.OSDisk.OsType
+            $sku     = $vm.HardwareProfile.VmSize
+            $tags    = $vm.Tags
+
+            $isWindowsOrSQL = $osDisk -eq "Windows" -or $sku -match "SQL"
+            $hasAHB         = $license -match "Windows_Server|Sql_Server"
+
+            $record = [PSCustomObject]@{
+                Name         = $vm.Name
+                OS           = $osDisk
+                Size         = $sku
+                LicenseType  = $license
+                ResourceGroup= $vm.ResourceGroupName
+                Location     = $vm.Location
+                HybridBenefit= $hasAHB
+                HasAHBTag    = $tags.ContainsKey("hybridbenefit")
+            }
+
+            if ($hasAHB) {
+                $licensedVMs += $record
+            } elseif ($isWindowsOrSQL) {
+                $unlicensedVMs += $record
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result  = $licensedVMs.Count -gt 0
+            Summary = @{
+                TotalVMsChecked       = $vms.Count
+                VMsWithAHB            = $licensedVMs.Count
+                PotentiallyUnlicensed = $unlicensedVMs.Count
+            }
+            Details = @{
+                LicensedVMs     = $licensedVMs
+                UnlicensedVMs   = $unlicensedVMs
+            }
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Summary = "🚨 Failed to check Hybrid Benefit licensing"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check if budget alerts or thresholds are configured
+
+function Check-SpendingAlertsConfigured {
+    try {
+        $alertsSet = @()
+        $methodUsed = ""
+        $budgetObjects = $null
+
+        # --- Try Azure Resource Graph ---
+        $budgetObjects = Search-AzGraph -Query "Resources | where type =~ 'microsoft.costmanagement/budgets'"
+        $methodUsed = "Search-AzGraph"
+
+        # --- If Graph returns nothing, fall back to REST ---
+        if (-not $budgetObjects -or $budgetObjects.Count -eq 0) {
+            $subId = (Get-AzContext).Subscription.Id
+            $accessToken = Get-AzAccessToken -ResourceUrl "https://management.azure.com/"
+            $plainToken = ConvertFrom-SecureString -SecureString $accessToken.Token -AsPlainText
+            $uri = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.CostManagement/budgets?api-version=2023-03-01"
+            $headers = @{ Authorization = "Bearer $plainToken" }
+
+            $restResponse = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+            $budgetObjects = $restResponse.value
+            $methodUsed = "REST API"
+        }
+
+        # --- Parse Notification Settings ---
+        foreach ($budget in $budgetObjects) {
+            if ($budget.properties.Notification) {
+                foreach ($key in $budget.properties.Notification.Keys) {
+                    $notification = $budget.properties.Notification[$key]
+
+                    $alertsSet += [PSCustomObject]@{
+                        BudgetName     = $budget.name
+                        Scope          = $budget.id
+                        Amount         = $budget.properties.amount
+                        ThresholdPct   = $notification.threshold
+                        ThresholdType  = $notification.thresholdType
+                        Enabled        = $notification.enabled
+                        Contacts       = ($notification.contactEmails -join ", ")
+                        Operator       = $notification.operator
+                    }
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result      = ($alertsSet.Count -gt 0)
+            MethodUsed  = $methodUsed
+            Summary     = @{
+                BudgetsScanned      = if ($budgetObjects) { $budgetObjects.Count } else { 0 }
+                AlertsConfigured    = $alertsSet.Count
+            }
+            Details = $alertsSet
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Summary = "🚨 Full fallback chain failed"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+###################################
+###                             ###
+### Operation Excellence Pillar ###
+###                             ###
+###################################
+
+# TODO: To fully check we would need to also evaluate the tags of resources.
+# Check for IaC deployments
+function Check-InfrastructureAsCodeAudit {
+    try {
+        $deployments = Get-AzDeployment
+        $iacDeployments = @()
+
+        foreach ($dep in $deployments) {
+            if ($dep.Template -ne $null -or $dep.TemplateLink -ne $null) {
+                $iacDeployments += [PSCustomObject]@{
+                    DeploymentName    = $dep.DeploymentName
+                    Location          = $dep.Location
+                    Timestamp         = $dep.Timestamp
+                    Mode              = $dep.Mode
+                    TemplateSource    = if ($dep.TemplateLink) { "Linked" } else { "Inline" }
+                    ProvisioningState = $dep.ProvisioningState
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result = ($iacDeployments.Count -gt 0)
+            Summary = @{
+                TotalDeployments       = $deployments.Count
+                IaCDeploymentsDetected = $iacDeployments.Count
+            }
+            Details = $iacDeployments
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Summary = "🚨 Failed to audit infrastructure-as-code deployments"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check if Deployments are done via AzureDevops, overwrite if using for example github or gitlab
+function Check-CICDPipelines {
+    try {
+        # Requires Az.DevOps module
+        $projects = Get-AzDevOpsProject
+        $pipelines = @()
+
+        foreach ($proj in $projects) {
+            $pl = Get-AzDevOpsPipeline -ProjectName $proj.Name
+            $pipelines += $pl
+        }
+
+        return [PSCustomObject]@{
+            Result  = ($pipelines.Count -gt 0)
+            Details = $pipelines
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Details = "Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Check if telemetry is centralized via Log Analytics workspaces
+function Check-TelemetryFlowStatus {
+    try {
+        # Detect resources with diagnostics capability
+        $providers = Get-AzResourceProvider
+        $diagnosticCapableTypes = $providers.ResourceTypes | Where-Object {
+            $_.Locations -and $_.ApiVersions -and $_.ResourceType -match "/virtualMachines$|/sites$|/servers$|/vaults$|/storageAccounts$|/managedClusters$|/networkWatchers$"
+        } | ForEach-Object { "$($_.ProviderNamespace)/$($_.ResourceType)" }
+
+        $resources = Get-AzResource | Where-Object { $diagnosticCapableTypes -contains $_.Type }
+
+        $telemetryCovered = @()
+        $telemetryMissing = @()
+
+        foreach ($res in $resources) {
+            try {
+                $diag = Get-AzDiagnosticSetting -ResourceId $res.ResourceId
+                $logsFlowing = $diag.Logs | Where-Object { $_.Enabled -eq $true }
+                $metricsFlowing = $diag.Metrics | Where-Object { $_.Enabled -eq $true }
+
+                if ($diag.WorkspaceId -and ($logsFlowing.Count -gt 0 -or $metricsFlowing.Count -gt 0)) {
+                    $telemetryCovered += [PSCustomObject]@{
+                        ResourceName  = $res.Name
+                        ResourceType  = $res.Type
+                        LogsEnabled   = $logsFlowing.Count
+                        MetricsEnabled= $metricsFlowing.Count
+                        WorkspaceId   = $diag.WorkspaceId
+                    }
+                } else {
+                    $telemetryMissing += [PSCustomObject]@{
+                        ResourceName  = $res.Name
+                        ResourceType  = $res.Type
+                        Reason        = "Diagnostic setting exists but not actively sending logs or metrics"
+                    }
+                }
+            } catch {
+                # Resource has no diagnostic setting at all
+                $telemetryMissing += [PSCustomObject]@{
+                    ResourceName  = $res.Name
+                    ResourceType  = $res.Type
+                    Reason        = "No diagnostic setting configured"
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result = ($telemetryCovered.Count -gt 0)
+            Summary = @{
+                ResourcesScanned        = $resources.Count
+                ActiveTelemetrySources  = $telemetryCovered.Count
+                MissingTelemetrySources = $telemetryMissing.Count
+            }
+            Details = @{
+                TelemetryActive   = $telemetryCovered
+                TelemetryMissing  = $telemetryMissing
+            }
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Summary = "🚨 Telemetry flow check failed"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check if automation runbooks exist for incident response
+function Check-IncidentRunbooksAudit {
+    try {
+        $automationAccounts = Get-AzAutomationAccount
+        $incidentRunbooks = @()
+        $draftRunbooks = @()
+
+        foreach ($account in $automationAccounts) {
+            $runbooks = Get-AzAutomationRunbook `
+                -AutomationAccountName $account.AutomationAccountName `
+                -ResourceGroupName $account.ResourceGroupName
+
+            foreach ($rb in $runbooks) {
+                $isIncidentRunbook = $rb.Name -match "incident|remediate|alert"
+
+                if ($isIncidentRunbook) {
+                    $record = [PSCustomObject]@{
+                        Name              = $rb.Name
+                        State             = $rb.State
+                        Type              = $rb.RunbookType
+                        LastModifiedDate  = $rb.LastModifiedDate
+                        ResourceGroup     = $account.ResourceGroupName
+                        AutomationAccount = $account.AutomationAccountName
+                    }
+
+                    if ($rb.State -eq "Published") {
+                        $incidentRunbooks += $record
+                    } else {
+                        $draftRunbooks += $record
+                    }
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result = ($incidentRunbooks.Count -gt 0)
+            Summary = @{
+                AutomationAccountsScanned = $automationAccounts.Count
+                IncidentRunbooksPublished = $incidentRunbooks.Count
+                DraftIncidentRunbooks     = $draftRunbooks.Count
+            }
+            Details = @{
+                PublishedRunbooks = $incidentRunbooks
+                DraftRunbooks     = $draftRunbooks
+            }
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Summary = "🚨 Failed to audit incident runbooks"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check if scheduled query rules (alerts) are configured
+function Check-AlertingOperationalAudit {
+    try {
+        $alerts = Get-AzScheduledQueryRule
+        $validAlerts = @()
+        $flaggedAlerts = @()
+
+        foreach ($alert in $alerts) {
+            $isLinked = $alert.ActionGroupId -ne $null
+            $isSevere = $alert.Severity -lt 3
+            $isEnabled = $alert.Enabled
+
+            $record = [PSCustomObject]@{
+                Name           = $alert.Name
+                ResourceGroup  = $alert.ResourceGroupName
+                Severity       = $alert.Severity
+                ActionGroupSet = $isLinked
+                Enabled        = $isEnabled
+                Description    = $alert.Description
+            }
+
+            if ($isLinked -and $isSevere -and $isEnabled) {
+                $validAlerts += $record
+            } else {
+                $flaggedAlerts += $record
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result = ($validAlerts.Count -gt 0)
+            Summary = @{
+                TotalAlertsScanned  = $alerts.Count
+                AlertsReady         = $validAlerts.Count
+                AlertsFlagged       = $flaggedAlerts.Count
+            }
+            Details = @{
+                ActiveAlerts   = $validAlerts
+                FlaggedAlerts  = $flaggedAlerts
+            }
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Summary = "🚨 Failed to evaluate scheduled query alerts"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check if portal dashboards exist and can be RBAC-controlled
+function Check-DashboardRBACAccess {
+    try {
+        $dashboards = $null
+        $methodUsed = ""
+
+        # --- Attempt Resource Graph ---
+        try {
+            $dashboards = Search-AzGraph -Query "Resources | where type == 'microsoft.portal/dashboards' | project name, id, resourceGroup, tags"
+            $methodUsed = "Resource Graph"
+        } catch {
+            # ignore and attempt REST fallback
+        }
+
+        # --- Fallback to REST API if Graph fails or returns nothing ---
+        if (-not $dashboards -or $dashboards.Count -eq 0) {
+            $subId = (Get-AzContext).Subscription.Id
+            $token = ConvertFrom-SecureString -SecureString (Get-AzAccessToken -ResourceUrl "https://management.azure.com/").Token -AsPlainText
+            $uri = "https://management.azure.com/subscriptions/$subId/resources?api-version=2021-04-01&`$filter=resourceType eq 'Microsoft.Portal/dashboards'"
+            $headers = @{ Authorization = "Bearer $token" }
+
+            $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+            $dashboards = $response.value
+            $methodUsed = "REST API"
+        }
+
+        $restrictedDashboards = @()
+        $defaultDashboards = @()
+
+        foreach ($db in $dashboards) {
+            $id = if ($db.id) { $db.id } else { $db.Id }
+            $name = if ($db.name) { $db.name } else { $db.Name }
+            $group = if ($db.resourceGroup) { $db.resourceGroup } else { ($id -split "/")[4] }
+
+            try {
+                $acl = Get-AzRoleAssignment -Scope $id
+                if ($acl.Count -gt 0) {
+                    $accessDetails = $acl | Select-Object RoleDefinitionName, PrincipalType, PrincipalName
+                    $restrictedDashboards += [PSCustomObject]@{
+                        DashboardName = $name
+                        ResourceGroup = $group
+                        DashboardId   = $id
+                        AccessRoles   = $accessDetails
+                    }
+                } else {
+                    $defaultDashboards += [PSCustomObject]@{
+                        DashboardName = $name
+                        ResourceGroup = $group
+                        DashboardId   = $id
+                        AccessRoles   = @("No explicit assignments found")
+                    }
+                }
+            } catch {
+                $defaultDashboards += [PSCustomObject]@{
+                    DashboardName = $name
+                    ResourceGroup = $group
+                    DashboardId   = $id
+                    AccessRoles   = @("Error retrieving role assignments")
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result = ($restrictedDashboards.Count -gt 0)
+            MethodUsed = $methodUsed
+            Summary = @{
+                DashboardsScanned       = $dashboards.Count
+                WithCustomRBAC          = $restrictedDashboards.Count
+                UsingDefaultPermissions = $defaultDashboards.Count
+            }
+            Details = @{
+                RestrictedDashboards   = $restrictedDashboards
+                DefaultScopeDashboards = $defaultDashboards
+            }
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Summary = "🚨 Failed to complete dashboard RBAC audit"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check if configuration drift detection policies or reports are available
+function Check-ConfigDriftDetectionAudit {
+    try {
+        $nonCompliantStates = Get-AzPolicyState | Where-Object {
+            $_.ComplianceState -eq "NonCompliant"
+        }
+
+        $automationAccounts = Get-AzAutomationAccount
+        $dsConfigs = @()
+
+        foreach ($account in $automationAccounts) {
+            $configs = Get-AzAutomationDscConfiguration `
+                -AutomationAccountName $account.AutomationAccountName `
+                -ResourceGroupName $account.ResourceGroupName
+
+            foreach ($cfg in $configs) {
+                $dsConfigs += [PSCustomObject]@{
+                    Name              = $cfg.Name
+                    State             = $cfg.State
+                    AutomationAccount = $account.AutomationAccountName
+                    ResourceGroup     = $account.ResourceGroupName
+                    CreatedTime       = $cfg.CreationTime
+                }
+            }
+        }
+
+        $driftSummary = $nonCompliantStates | Select-Object PolicyAssignmentName, ResourceId, ComplianceState, Timestamp
+
+        return [PSCustomObject]@{
+            Result = ($nonCompliantStates.Count -eq 0 -and $dsConfigs.Count -gt 0)
+            Summary = @{
+                NonCompliantPolicies = $nonCompliantStates.Count
+                DSCConfigurations    = $dsConfigs.Count
+                AutomationAccounts   = $automationAccounts.Count
+            }
+            Details = @{
+                DriftDetected        = $driftSummary
+                DesiredStateConfigs  = $dsConfigs
+            }
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Summary = "🚨 Could not assess config drift"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+
+###################################
+###                             ###
+###     Performance Pillar      ###
+###                             ###
+###################################
+
+# Check if autoscaling is configured for workloads
+function Check-AutoscalingConfigured {
+    try {
+        $settings = Get-AzAutoscaleSetting
+        $demandBased = @()
+
+        foreach ($setting in $settings) {
+            foreach ($profile in $setting.Profiles) {
+                foreach ($rule in $profile.Rules) {
+                    if ($rule.MetricTrigger.MetricName -match "Cpu|Memory") {
+                        $demandBased += [PSCustomObject]@{
+                            TargetResourceId = $setting.TargetResourceId
+                            AutoscaleSetting = $setting.Name
+                            ProfileName      = $profile.Name
+                            MetricName       = $rule.MetricTrigger.MetricName
+                            Direction        = $rule.ScaleAction.Direction
+                            Cooldown         = $rule.ScaleAction.Cooldown
+                        }
+                    }
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result  = ($demandBased.Count -gt 0)
+            Summary = @{
+                AutoscaleSettingsScanned = $settings.Count
+                DemandBasedProfiles      = $demandBased.Count
+            }
+            Details = $demandBased
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result  = $false
+            Summary = "🚨 Failed to check autoscaling configuration"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check for recent or configured load tests
+function Check-LoadTestRuns {
+    try {
+        $loadTests = $null
+        $methodUsed = ""
+        $accessToken = ""
+        $headers = @{}
+
+        # --- Always Retrieve Token in Advance ---
+        try {
+
+            $accessToken = Get-AzAccessToken -ResourceUrl "https://management.azure.com/"
+            $plainToken = ConvertFrom-SecureString -SecureString $accessToken.Token -AsPlainText
+            $headers = @{ Authorization = "Bearer $plainToken" }
+        } catch {
+            throw "🔐 Failed to retrieve access token"
+        }
+
+        # --- Try Azure Resource Graph ---
+        try {
+            $loadTests = Search-AzGraph -Query "Resources | where type =~ 'Microsoft.LoadTestService/loadTests' | project name, id, location, resourceGroup"
+            $methodUsed = "Resource Graph"
+        } catch {}
+
+        # --- Fallback to REST API if Graph fails or returns nothing ---
+        if (-not $loadTests -or $loadTests.Count -eq 0) {
+            $subId = (Get-AzContext).Subscription.Id
+            $uri = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.LoadTestService/loadTests?api-version=2022-12-01"
+
+            $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+            $loadTests = $response.value
+            $methodUsed = "REST API"
+        }
+
+        $configuredTests = @()
+        $testsWithRuns = @()
+
+        foreach ($test in $loadTests) {
+            $testId = if ($test.id) { $test.id } else { $test.Id }
+            $testName = if ($test.name) { $test.name } else { $test.Name }
+            $location = if ($test.location) { $test.location } else { $test.Location }
+            $group = if ($test.resourceGroup) { $test.resourceGroup } else { ($testId -split "/")[4] }
+
+            # --- Retrieve test run history ---
+            $runUri = "https://management.azure.com$testId/testRuns?api-version=2022-12-01"
+            try {
+                $runResponse = Invoke-RestMethod -Method Get -Uri $runUri -Headers $headers
+                $runCount = if ($runResponse.value) { $runResponse.value.Count } else { 0 }
+            } catch {
+                $runCount = 0
+            }
+
+            $configuredTests += [PSCustomObject]@{
+                TestName       = $testName
+                ResourceGroup  = $group
+                Location       = $location
+                ResourceId     = $testId
+                RunCount       = $runCount
+            }
+
+            if ($runCount -gt 0) {
+                $testsWithRuns += $testName
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result = ($testsWithRuns.Count -gt 0)
+            MethodUsed = $methodUsed
+            Summary = @{
+                LoadTestsFound     = $configuredTests.Count
+                TestsWithRunHistory= $testsWithRuns.Count
+            }
+            Details = $configuredTests
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Summary = "🚨 Failed to retrieve Azure Load Test configurations and runs"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check if Redis or CDN caches are deployed
+function Check-CachingStrategyAudit {
+    try {
+        $redisCaches = @()
+        $cdnProfiles = @()
+        $frontDoors  = @()
+
+        # --- Redis ---
+        try {
+            $redis = Get-AzRedisCache
+            foreach ($r in $redis) {
+                $redisCaches += [PSCustomObject]@{
+                    Type     = "Redis"
+                    Name     = $r.Name
+                    Location = $r.Location
+                    Sku      = $r.Sku.Name
+                }
+            }
+        } catch {}
+
+        # --- CDN ---
+        try {
+            $cdn = Get-AzCdnProfile | Where-Object { $_.Sku.Name -match "Standard|Premium" }
+            foreach ($c in $cdn) {
+                $cdnProfiles += [PSCustomObject]@{
+                    Type     = "CDN"
+                    Name     = $c.Name
+                    Location = $c.Location
+                    Sku      = $c.Sku.Name
+                }
+            }
+        } catch {}
+
+        # --- Front Door ---
+        try {
+            $fd = Get-AzFrontDoor
+            foreach ($f in $fd) {
+                foreach ($rule in $f.Properties.RoutingRules) {
+                    if ($rule.CacheConfiguration.QueryStringCachingBehavior -ne "IgnoreQueryString") {
+                        $frontDoors += [PSCustomObject]@{
+                            Type     = "FrontDoor"
+                            Name     = $f.Name
+                            Location = $f.Location
+                            RuleName = $rule.Name
+                            Caching  = $rule.CacheConfiguration.QueryStringCachingBehavior
+                        }
+                    }
+                }
+            }
+        } catch {}
+
+        $cachingLayers = $redisCaches + $cdnProfiles + $frontDoors
+
+        return [PSCustomObject]@{
+            Result = ($cachingLayers.Count -gt 0)
+            Summary = @{
+                RedisCaches   = $redisCaches.Count
+                CDNProfiles   = $cdnProfiles.Count
+                FrontDoorRules= $frontDoors.Count
+            }
+            Details = $cachingLayers
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Summary = "🚨 Failed to evaluate caching strategy"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check for SQL Performance tuning recommendations
+function Check-SQLPerformanceAdvisorAudit {
+    try {
+        $sqlServers = Get-AzSqlServer
+        $recommendations = @()
+
+        foreach ($server in $sqlServers) {
+            $databases = Get-AzSqlDatabase `
+                -ResourceGroupName $server.ResourceGroupName `
+                -ServerName $server.ServerName
+
+            foreach ($db in $databases) {
+                $recs = Get-AzSqlDatabaseRecommendedAction `
+                    -ResourceGroupName $server.ResourceGroupName `
+                    -ServerName $server.ServerName `
+                    -DatabaseName $db.DatabaseName
+
+                foreach ($rec in $recs) {
+                    if ($rec.State -eq "Active" -and $rec.IsExecutable) {
+                        $recommendations += [PSCustomObject]@{
+                            Server       = $server.ServerName
+                            Database     = $db.DatabaseName
+                            Recommendation = $rec.Name
+                            Description  = $rec.ImplementationDetails.Description
+                            EstimatedGain= $rec.EstimatedImpact.AbsoluteValue
+                        }
+                    }
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result = ($recommendations.Count -gt 0)
+            Summary = @{
+                SqlServersScanned     = $sqlServers.Count
+                DatabasesWithAdvice   = $recommendations.Count
+            }
+            Details = $recommendations
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Summary = "🚨 Failed to retrieve SQL performance recommendations"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check if Front Door or CDN acceleration is configured
+function Check-NetworkAccelerationAudit {
+    try {
+        $cdnAccelerators = @()
+        $frontDoorAccelerators = @()
+
+        # --- CDN Profiles ---
+        try {
+            $cdnProfiles = Get-AzCdnProfile | Where-Object { $_.Sku.Name -match "Standard|Premium" }
+            foreach ($cdn in $cdnProfiles) {
+                $cdnAccelerators += [PSCustomObject]@{
+                    Type     = "CDN"
+                    Name     = $cdn.Name
+                    Location = $cdn.Location
+                    Sku      = $cdn.Sku.Name
+                }
+            }
+        } catch {}
+
+        # --- Front Door Rules ---
+        try {
+            $frontDoors = Get-AzFrontDoor
+            foreach ($fd in $frontDoors) {
+                foreach ($rule in $fd.Properties.RoutingRules) {
+                    if ($rule.CacheConfiguration -and $rule.CacheConfiguration.QueryStringCachingBehavior -ne "IgnoreQueryString") {
+                        $frontDoorAccelerators += [PSCustomObject]@{
+                            Type         = "FrontDoor"
+                            Name         = $fd.Name
+                            RuleName     = $rule.Name
+                            Location     = $fd.Location
+                            CachingStyle = $rule.CacheConfiguration.QueryStringCachingBehavior
+                        }
+                    }
+                }
+            }
+        } catch {}
+
+        $totalAccelerators = $cdnAccelerators + $frontDoorAccelerators
+
+        return [PSCustomObject]@{
+            Result = ($totalAccelerators.Count -gt 0)
+            Summary = @{
+                CDNProfilesFound      = $cdnAccelerators.Count
+                FrontDoorRulesMatched = $frontDoorAccelerators.Count
+            }
+            Details = $totalAccelerators
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Summary = "🚨 Failed to evaluate network acceleration"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check for Service Bus or Event Grid use for async messaging
+function Check-MessagingServicesAudit {
+    try {
+        $serviceBusItems = @()
+        $eventGridItems = @()
+
+        # --- Service Bus Namespaces ---
+        try {
+            $busNamespaces = Get-AzServiceBusNamespace
+            foreach ($ns in $busNamespaces) {
+                $serviceBusItems += [PSCustomObject]@{
+                    Type         = "ServiceBus"
+                    Namespace    = $ns.Name
+                    Location     = $ns.Location
+                    Sku          = $ns.Sku.Name
+                    ResourceGroup= $ns.ResourceGroupName
+                }
+            }
+        } catch {}
+
+        # --- Event Grid Topics ---
+        try {
+            $topics = Get-AzEventGridTopic
+            foreach ($topic in $topics) {
+                $eventGridItems += [PSCustomObject]@{
+                    Type         = "EventGrid"
+                    TopicName    = $topic.Name
+                    Location     = $topic.Location
+                    ResourceGroup= $topic.ResourceGroupName
+                    ProvisioningState = $topic.ProvisioningState
+                }
+            }
+        } catch {}
+
+        $messaging = $serviceBusItems + $eventGridItems
+
+        return [PSCustomObject]@{
+            Result = ($messaging.Count -gt 0)
+            Summary = @{
+                ServiceBusNamespaces = $serviceBusItems.Count
+                EventGridTopics      = $eventGridItems.Count
+            }
+            Details = $messaging
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Summary = "🚨 Failed to evaluate messaging services"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check if resource SKU sizes match workload demands
+function Check-SKUAlignmentAudit {
+    try {
+        $vms = Get-AzVM
+        $lowTierSkuFamilyPattern = "^B1s$|^B1ms$|^A[0-2]$|^D1$|^D2$"
+        $misalignedVms = @()
+        $acceptableBurstables = @()
+        $tagNamingIssues = @()
+
+        foreach ($vm in $vms) {
+            $vmSizeRaw = $vm.HardwareProfile.VmSize  # e.g. Standard_B1s
+            $vmSizeParts = $vmSizeRaw -split "_"
+            $skuFamily = if ($vmSizeParts.Count -gt 1) { $vmSizeParts[1] } else { $vmSizeRaw }
+
+            $tags = $vm.Tags
+
+            # --- Retrieve tag values robustly ---
+            $envValue = ($tags.GetEnumerator() | Where-Object { $_.Key -match "^(env|environment)$" }).Value
+            if (-not $envValue) { $envValue = "unknown" }
+
+            $criticality = ($tags.GetEnumerator() | Where-Object { $_.Key -match "^criticality$" }).Value
+            if (-not $criticality) { $criticality = "unknown" }
+
+            # --- Detect tag naming issues ---
+            $envKeyActual = ($tags.Keys | Where-Object { $_ -match "^(env|environment)$" })
+            if ($envKeyActual.Count -eq 0) {
+                $tagNamingIssues += [PSCustomObject]@{
+                    VMName = $vm.Name
+                    Issue  = "Missing environment tag (env/environment)"
+                }
+            } elseif ($envKeyActual[0] -ne "env") {
+                $tagNamingIssues += [PSCustomObject]@{
+                    VMName = $vm.Name
+                    Issue  = "Environment tag uses '$($envKeyActual[0])' instead of 'env'"
+                }
+            }
+
+            # --- Evaluate alignment ---
+            $isBurstable = ($skuFamily -match "^B.*")
+            $matchesLowTier = ($skuFamily -match $lowTierSkuFamilyPattern)
+
+            if ($matchesLowTier -or $isBurstable) {
+                $contextOk = (
+                    $isBurstable -and
+                    ($envValue -match "dev|test|staging") -and
+                    ($criticality -match "low|medium")
+                )
+
+                $record = [PSCustomObject]@{
+                    VMName        = $vm.Name
+                    Location      = $vm.Location
+                    VmSize        = $vmSizeRaw
+                    SkuFamily     = $skuFamily
+                    ResourceGroup = $vm.ResourceGroupName
+                    OS            = $vm.StorageProfile.OsDisk.OsType
+                    Environment   = $envValue
+                    Criticality   = $criticality
+                    Justified     = $contextOk
+                }
+
+                if ($contextOk) {
+                    $acceptableBurstables += $record
+                } else {
+                    $misalignedVms += $record
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result = ($misalignedVms.Count -eq 0)
+            Summary = @{
+                TotalVMsScanned        = $vms.Count
+                MisalignedSKUs         = $misalignedVms.Count
+                AcceptableBurstables   = $acceptableBurstables.Count
+                TagNamingIssuesFound   = $tagNamingIssues.Count
+            }
+            Details = @{
+                Misaligned       = $misalignedVms
+                Acceptable       = $acceptableBurstables
+                TagIssues        = $tagNamingIssues
+            }
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Summary = "🚨 Failed to assess VM SKU alignment"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check if diagnostics and telemetry are enabled
+function Check-PerformanceMonitoringAudit {
+    try {
+        $resources = Get-AzResource
+        $diagnostics = @()
+        $noDiagnostics = @()
+
+        foreach ($res in $resources) {
+            try {
+                $diag = Get-AzDiagnosticSetting -ResourceId $res.ResourceId -ErrorAction SilentlyContinue
+
+                if ($diag) {
+                    $diagnostics += [PSCustomObject]@{
+                        ResourceName       = $res.Name
+                        ResourceType       = $res.ResourceType
+                        Location           = $res.Location
+                        DiagnosticsEnabled = $diag.Enabled
+                        LogsEnabled        = ($diag.Logs.Count -gt 0)
+                        MetricsEnabled     = ($diag.Metrics.Count -gt 0)
+                        AppInsightsTarget  = $diag.ApplicationInsightsId
+                        LogAnalyticsTarget = $diag.WorkspaceId
+                    }
+                } else {
+                    $noDiagnostics += [PSCustomObject]@{
+                        ResourceName = $res.Name
+                        ResourceType = $res.ResourceType
+                        Location     = $res.Location
+                        Reason       = "No diagnostic setting configured"
+                    }
+                }
+            } catch {
+                # Could not retrieve diagnostics
+                $noDiagnostics += [PSCustomObject]@{
+                    ResourceName = $res.Name
+                    ResourceType = $res.ResourceType
+                    Location     = $res.Location
+                    Reason       = "Error retrieving diagnostic setting"
+                }
+            }
+        }
+
+        $appInsights = Get-AzApplicationInsights
+        $logWorkspaces = Get-AzOperationalInsightsWorkspace
+
+        return [PSCustomObject]@{
+            Result = ($diagnostics.Count -gt 0)
+            Summary = @{
+                ResourcesScanned       = $resources.Count
+                ResourcesWithTelemetry = $diagnostics.Count
+                ResourcesWithout       = $noDiagnostics.Count
+                AppInsightsFound       = $appInsights.Count
+                LogWorkspacesFound     = $logWorkspaces.Count
+            }
+            Details = @{
+                WithDiagnostics    = $diagnostics
+                WithoutDiagnostics = $noDiagnostics
+                AppInsights        = $appInsights
+                LogWorkspaces      = $logWorkspaces
+            }
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Summary = "🚨 Failed to audit telemetry wiring"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# TODO: To fully check also for terraform deployements we would also have to evaluate Tags and they need to be in place like managedBy = terraform
+# Check if template-based resource provisioning exists
+function Check-ProvisioningTemplatesAudit {
+    try {
+        $resourceGroups = Get-AzResourceGroup
+        $templateDeployments = @()
+
+        foreach ($rg in $resourceGroups) {
+            $deployments = Get-AzResourceGroupDeployment -ResourceGroupName $rg.ResourceGroupName -ErrorAction SilentlyContinue
+
+            foreach ($dep in $deployments) {
+                if ($dep.TemplateLink -ne $null -or $dep.Template -ne $null) {
+                    $templateDeployments += [PSCustomObject]@{
+                        ResourceGroup     = $rg.ResourceGroupName
+                        DeploymentName    = $dep.DeploymentName
+                        Timestamp         = $dep.Timestamp
+                        Mode              = $dep.Mode
+                        TemplateSource    = if ($dep.TemplateLink) { "Linked" } else { "Inline" }
+                        ProvisioningState = $dep.ProvisioningState
+                    }
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result = ($templateDeployments.Count -gt 0)
+            Summary = @{
+                ResourceGroupsScanned     = $resourceGroups.Count
+                TemplateBasedDeployments  = $templateDeployments.Count
+            }
+            Details = $templateDeployments
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Summary = "🚨 Failed to audit template-based provisioning"
+            Details = $_.Exception.Message
+        }
+    }
+}
+
+# Check for established performance metrics or baselines
+function Check-CriticalTelemetryCoverage {
+    try {
+        # --- Define blacklist for resource types that don't emit metrics ---
+        $resourceTypeBlacklist = @(
+            "Microsoft.Resources/deployments",
+            "Microsoft.Resources/templateSpecs",
+            "Microsoft.DevTestLab/labs",
+            "Microsoft.Authorization/policyAssignments",
+            "Microsoft.Web/certificates"
+        )
+
+        # --- Identify critical resources via tags or naming conventions ---
+        $criticalResources = Get-AzResource | Where-Object {
+            ($_.Tags["criticality"] -eq "high" -or $_.Name -match "prod|core|critical") -and
+            ($resourceTypeBlacklist -notcontains $_.ResourceType)
+        }
+
+        $monitored = @()
+        $unmonitored = @()
+
+        foreach ($res in $criticalResources) {
+            try {
+                $metrics = Get-AzMetricDefinition -ResourceId $res.ResourceId -ErrorAction SilentlyContinue
+                if ($metrics.Count -gt 0) {
+                    $metricNames = $metrics | ForEach-Object { $_.Name.Value }
+                    $monitored += [PSCustomObject]@{
+                        ResourceName = $res.Name
+                        ResourceType = $res.ResourceType
+                        Location     = $res.Location
+                        MetricsFound = $metricNames
+                    }
+                } else {
+                    $unmonitored += [PSCustomObject]@{
+                        ResourceName = $res.Name
+                        ResourceType = $res.ResourceType
+                        Location     = $res.Location
+                        Reason       = "No performance metrics exposed"
+                    }
+                }
+            } catch {
+                $unmonitored += [PSCustomObject]@{
+                    ResourceName = $res.Name
+                    ResourceType = $res.ResourceType
+                    Location     = $res.Location
+                    Reason       = "Error retrieving metric definitions"
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Result = ($unmonitored.Count -eq 0)
+            Summary = @{
+                CriticalResourcesChecked = $criticalResources.Count
+                WithMetrics              = $monitored.Count
+                MissingMetrics           = $unmonitored.Count
+            }
+            Details = @{
+                TelemetryEnabled   = $monitored
+                TelemetryMissing   = $unmonitored
+            }
+        }
+
+    } catch {
+        return [PSCustomObject]@{
+            Result = $false
+            Summary = "🚨 Failed to audit critical telemetry coverage"
+            Details = $_.Exception.Message
+        }
+    }
+}
