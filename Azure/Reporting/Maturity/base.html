@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Azure WAF Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+      body {
+        font-family: "Segoe UI Emoji", "Segoe UI", sans-serif;
+        margin: 0;
+        padding: 30px;
+        background: #f0f2f5;
+        color: #333;
+        transition: all 0.3s ease;
+      }
+      .dark-mode {
+        background: #121212;
+        color: #eee;
+      }
+      canvas {
+        background: #fff;
+        border-radius: 8px;
+        margin-bottom: 40px;
+      }
+      .dark-mode canvas {
+        background: #1e1e1e;
+      }
+      .container {
+        max-width: 960px;
+        margin: auto;
+      }
+      h2,
+      h3 {
+        text-align: center;
+      }
+      .controls {
+        text-align: center;
+        margin-bottom: 20px;
+      }
+      button {
+        margin: 5px;
+        padding: 8px 14px;
+        font-size: 0.9em;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h2>Azure Well-Architected Assessment Dashboard</h2>
+      <div class="controls">
+        <button onclick="toggleMode()">Toggle Dark Mode</button>
+      </div>
+
+      <h3>Architectural Maturity (Radar)</h3>
+      <canvas id="radarChart" width="400" height="400"></canvas>
+
+      <h3>Pillar Score Trends (Line)</h3>
+      <canvas id="lineChart" width="900" height="400"></canvas>
+
+      <h3>Pillar Score Changes Between Runs (Bar)</h3>
+      <canvas id="changeChart" width="900" height="400"></canvas>
+
+      <h3>Severity Breakdown of Failed Checks by Pillar</h3>
+      <canvas id="severityChart" width="900" height="400"></canvas>
+
+      <!-- AzureChecksPlaceholder -->
+      <div class="controls">
+        <button onclick="exportOverrides()">Export Overrides</button>
+        <button onclick="saveOverrides()">💾 Save Overrides</button>
+      </div>
+
+      <!-- ActionItemsPlaceholder -->
+    </div>
+
+    <script>
+      const radarConfig = {
+        type: "radar",
+        data: {
+          labels: $radarLabels,
+          datasets: [
+            {
+              label: "Normalized Maturity (%)",
+              data: $radarValues,
+              backgroundColor: "rgba(60,179,113,0.2)",
+              borderColor: "mediumseagreen",
+              borderWidth: 2,
+              pointBackgroundColor: "mediumseagreen",
+            },
+          ],
+        },
+        options: {
+          scales: {
+            r: {
+              beginAtZero: true,
+              max: $actualMaxRadar,
+              suggestedMax: $actualMaxRadar,
+            },
+          },
+        },
+      };
+      const lineConfig = {
+        type: "line",
+        data: $lineData,
+        options: {
+          responsive: true,
+          plugins: {
+            title: {
+              display: true,
+              text: "WAF Pillar Score Trends Over Time",
+              font: { size: 18 },
+            },
+            tooltip: {
+              enabled: true,
+              mode: "nearest",
+              intersect: false,
+              callbacks: {
+                label: function (ctx) {
+                  const label = ctx.dataset.label || "";
+                  const value = ctx.parsed.y !== null ? ctx.parsed.y : "";
+                  const date = ctx.label;
+                  $tooltipJs;
+                },
+              },
+            },
+            legend: {
+              position: "bottom",
+            },
+          },
+          scales: {
+            y: {
+              beginAtZero: true,
+              suggestedMax: $maxScoreY,
+              title: { display: true, text: "Score" },
+            },
+            x: {
+              title: { display: true, text: "Assessment Date" },
+            },
+          },
+          elements: {
+            point: {
+              radius: 4,
+              borderWidth: 1,
+            },
+          },
+        },
+      };
+      const changeConfig = {
+        type: "bar",
+        data: $changeChart,
+        options: {
+          responsive: true,
+          plugins: {
+            title: {
+              display: true,
+              text: "Score Deltas Between Assessments",
+            },
+            legend: { position: "bottom" },
+          },
+          scales: {
+            y: {
+              beginAtZero: true,
+              suggestedMin: -50,
+              suggestedMax: 50,
+              title: { display: true, text: "Change in Score" },
+            },
+            x: { title: { display: true, text: "Comparison Run" } },
+          },
+        },
+      };
+      const severityChart = new Chart(
+        document.getElementById("severityChart"),
+        {
+          type: "bar",
+          data: $severityChartData,
+          options: {
+            plugins: {
+              title: {
+                display: true,
+                text: "Failed Items by Severity Level per WAF Pillar",
+              },
+              legend: { position: "bottom" },
+            },
+            responsive: true,
+            scales: {
+              y: {
+                beginAtZero: true,
+                title: { display: true, text: "Failed Checks" },
+              },
+              x: {
+                title: { display: true, text: "WAF Pillar" },
+              },
+            },
+          },
+        }
+      );
+      document.querySelectorAll("textarea[id^='override-']").forEach((area) => {
+        const checkId = area.id.replace("override-", "");
+        const resultSpan = document.getElementById(`result-${checkId}`);
+        const scoreSpan = document.getElementById(`score-${checkId}`);
+        const saved = localStorage.getItem(area.id);
+
+        if (saved && saved.trim() !== "") {
+          area.value = saved;
+          resultSpan.innerHTML = "<strong>Passed (Override)</strong>";
+          resultSpan.style.color = "blue";
+          scoreSpan.textContent = "5"; // You can make this dynamic by embedding weights as data attributes if needed
+          area.insertAdjacentHTML(
+            "beforebegin",
+            "<span style='color:blue;'>🔄 <em>Manual Override Applied</em></span><br/>"
+          );
+        }
+
+        area.addEventListener("input", () => {
+          localStorage.setItem(area.id, area.value);
+
+          const badgeId = `badge-${area.id}`;
+          let badge = document.getElementById(badgeId);
+
+          if (area.value.trim() !== "") {
+            resultSpan.innerHTML = "<strong>Passed (Override)</strong>";
+            resultSpan.style.color = "blue";
+            scoreSpan.textContent = "5";
+
+            if (!badge) {
+              area.insertAdjacentHTML(
+                "beforebegin",
+                `<span id="${badgeId}" style="color:blue;"><em>🔄 Manual Override Applied</em></span><br/>`
+              );
+            }
+          } else {
+            resultSpan.innerHTML = "<strong>Failed</strong>";
+            resultSpan.style.color = "red";
+            scoreSpan.textContent = "0";
+
+            if (badge) {
+              badge.remove();
+            }
+          }
+        });
+      });
+
+      new Chart(document.getElementById("radarChart"), radarConfig);
+      new Chart(document.getElementById("lineChart"), lineConfig);
+      new Chart(document.getElementById("changeChart"), changeConfig);
+      function toggleMode() {
+        document.body.classList.toggle("dark-mode");
+      }
+      function exportOverrides() {
+        const overrides = {};
+        document
+          .querySelectorAll("textarea[id^='override-']")
+          .forEach((area) => {
+            if (area.value.trim()) {
+              overrides[area.id] = {
+                Text: area.value.trim(),
+                Validated: false,
+              };
+            }
+          });
+
+        const log = [
+          {
+            Date: new Date().toISOString(),
+            Overrides: overrides,
+            Reviewer: "Manual Entry", // Could also be user input
+          },
+        ];
+
+        const blob = new Blob([JSON.stringify(log, null, 2)], {
+          type: "application/json",
+        });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "manual_override_log.json";
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      }
+      function promptRevalidation(id) {
+        const note = document.getElementById("override-" + id).value;
+        const confirmed = confirm(
+          "Do you still want to override this check?\n\nJustification:\n" + note
+        );
+        if (!confirmed) {
+          document.getElementById("override-" + id).value = "";
+          localStorage.removeItem("override-" + id);
+          alert("Override cleared.");
+          // You can also revert visual result/score here
+        }
+      }
+
+      function saveOverrides() {
+        const overrides = {};
+        document
+          .querySelectorAll("textarea[id^='override-']")
+          .forEach((area) => {
+            if (area.value.trim()) {
+              overrides[area.id] = {
+                Text: area.value.trim(),
+                Validated: true,
+              };
+            }
+          });
+
+        fetch("http://localhost:5000/save-overrides", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(overrides),
+        }).then((res) => {
+          if (res.ok) {
+            alert("✅ Overrides saved!");
+            updateScoresAndCharts(overrides);
+          } else {
+            alert("❌ Failed to save overrides.");
+          }
+        });
+      }
+
+      function updateScoresAndCharts(overrides) {
+        let pillarScores = {};
+
+        document.querySelectorAll("li").forEach((li) => {
+          const idMatch = li.innerHTML.match(/override-(SE:\d+)/);
+          if (!idMatch) return;
+
+          const id = idMatch[1];
+          const override = overrides["override-" + id];
+          const scoreSpan = document.getElementById("score-" + id);
+          const resultSpan = document.getElementById("result-" + id);
+
+          if (override && override.Validated) {
+            scoreSpan.textContent = "5";
+            resultSpan.innerHTML = "<strong>Passed (Override)</strong>";
+            resultSpan.style.color = "blue";
+          } else {
+            scoreSpan.textContent = "0";
+            resultSpan.innerHTML = "<strong>Failed</strong>";
+            resultSpan.style.color = "red";
+          }
+
+          const pillar = li
+            .closest("details")
+            .querySelector("summary strong").textContent;
+          pillarScores[pillar] =
+            (pillarScores[pillar] || 0) + parseInt(scoreSpan.textContent);
+        });
+
+        // Update radar chart
+        radarChart.data.datasets[0].data = Object.values(pillarScores);
+        radarChart.update();
+
+        // Update line chart (optional)
+        // Update severity chart (optional)
+      }
+    </script>
+  </body>
+</html>
